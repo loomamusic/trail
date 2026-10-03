@@ -1,0 +1,446 @@
+<!DOCTYPE HTML>
+<html lang="en">
+    <head>
+        <meta charset="utf-8">
+        <style>
+            html, body {
+                margin: 0;
+                padding: 0;
+                width: 100%;
+                height: 100%;
+                overflow: hidden; /* Disables both vertical and horizontal scrolling */
+                background: #000;
+            }
+
+            canvas {
+                display: block;
+            }
+
+            /* The cursor hides once the mouse has been still for a while (see wake() in the script). */
+            html.idle canvas {
+                cursor: none;
+            }
+
+            /* Slider header: slides down while the mouse is over the top of the screen. */
+            #hud {
+                position: fixed;
+                top: 0;
+                left: 0;
+                right: 0;
+                display: grid;
+                grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+                gap: 10px 20px;
+                padding: 10px 16px 12px;
+                background: rgb(12 12 14 / 0.75);
+                backdrop-filter: blur(8px);
+                border-bottom: 1px solid rgb(255 255 255 / 0.1);
+                color: #ddd;
+                font: 12px/1.2 system-ui, sans-serif;
+                user-select: none;
+                transform: translateY(-100%);
+                visibility: hidden;
+                transition: transform 0.2s ease, visibility 0s 0.2s;
+            }
+            #hud.open {
+                transform: none;
+                visibility: visible;
+                transition-delay: 0s;
+            }
+            #hud label {
+                display: grid;
+                gap: 4px;
+            }
+            #hud span, #hud .end {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                gap: 8px;
+            }
+            #hud output {
+                color: #999;
+                font-variant-numeric: tabular-nums;
+            }
+            #hud input {
+                width: 100%;
+                margin: 0;
+                accent-color: #ddd;
+            }
+            #hud button {
+                font: inherit;
+                color: inherit;
+                background: rgb(255 255 255 / 0.08);
+                border: 1px solid rgb(255 255 255 / 0.2);
+                border-radius: 4px;
+                padding: 4px 12px;
+                cursor: pointer;
+            }
+            #hud button:hover {
+                background: rgb(255 255 255 / 0.16);
+            }
+            @media (prefers-reduced-motion: reduce) {
+                #hud {
+                    transition: none;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <canvas id="mainCanvas"></canvas>
+        <header id="hud">
+            <div class="end"><output id="fps"></output><button id="reset">Reset</button></div>
+        </header>
+        <script>
+            // ---- Tweakables ----------------------------------------------------------
+            // Each one gets a slider in the header: [default, min, max, step, what it does].
+            const TWEAKABLES = {
+                radius:     [80,   1,   250,   1,     'Head radius (px)'],
+                tailLength: [5000, 100, 15000, 100,   'How many circles the tail holds'],
+                tailCoef:   [-10,  -20, 5,     0.1,   'Tail size modifier. Positive = shrinks over time, negative = grows. Magnitude scales size.'],
+                glideTime:  [2,    0.2, 8,     0.1,   'Seconds to glide toward each new random point'],
+                iteration:  [5,    1,   20,    1,     'Circles added to the tail every 1/60 s'],
+                colorSpeed: [0.01, 0,   0.1,   0.001, 'Hue change per circle (degrees)'],
+                pull:       [700,  50,  3000,  10,    'Drift to the center: every 1/60 s, circles move 1/pull of the way there. Bigger = slower.'],
+                lightness:  [50,   0,   100,   1,     'Head lightness (%), fading to black at the end of the tail'],
+                saturation: [100,  0,   100,   1,     'Saturation (%)'],
+                speed:      [1,    0,   4,     0.05,  'Time scale (0 = paused)'],
+            };
+            // Current values, e.g. tweak.radius. The sliders write here and the animation reads from here,
+            // so it can also be changed from the console: tweak.tailCoef = 2
+            const tweak = {};
+            for (const name in TWEAKABLES) tweak[name] = TWEAKABLES[name][0];
+
+            // ---- Canvas --------------------------------------------------------------
+            const canvas = document.getElementById('mainCanvas');
+            let W, H;
+            function resize() {
+                W = canvas.width = innerWidth;
+                H = canvas.height = innerHeight;
+            }
+            resize();
+            addEventListener('resize', resize);
+
+            // ---- Tail ----------------------------------------------------------------
+            // A ring buffer: each new circle overwrites the oldest, so nothing is shifted.
+            let cap = 0;    // circles it can hold (tailLength)
+            let count = 0;  // circles it holds
+            let next = 0;   // where the next one goes
+            let posX, posY, hues;
+            let circles;    // what to draw, newest first: x, y, radius, hole radius, red, green, blue
+
+            function setTailLength(length) {
+                const newX = new Float32Array(length), newY = new Float32Array(length), newHue = new Float32Array(length);
+                const keep = Math.min(count, length); // the newest ones, oldest of them first
+                for (let k = 0; k < keep; k++) {
+                    const from = (next - 1 - k + cap) % cap, to = keep - 1 - k;
+                    newX[to] = posX[from];
+                    newY[to] = posY[from];
+                    newHue[to] = hues[from];
+                }
+                posX = newX;
+                posY = newY;
+                hues = newHue;
+                cap = length;
+                count = keep;
+                next = keep % length;
+                circles = new Float32Array(7 * length);
+            }
+
+            // ---- Head ----------------------------------------------------------------
+            // The head glides toward a random point: its velocity ramps from what it is now to the
+            // velocity that would reach the point in glideTime seconds, then a new point is picked.
+            let headX = Math.random() * W, headY = Math.random() * H;  // px
+            let velX = (Math.random() * W - headX) / tweak.glideTime;  // px per second
+            let velY = (Math.random() * H - headY) / tweak.glideTime;
+            let accX = 0, accY = 0;                                    // px per second, per second
+            let glideAt = 0, glideLength = 0;                          // seconds into this glide, and its length
+            let hue = 0;
+
+            function step(dt) {
+                hue = (hue + tweak.colorSpeed) % 360;
+                glideAt += dt;
+                if (glideAt >= glideLength || glideAt >= tweak.glideTime) { // a shorter glideTime cuts this glide short
+                    glideAt = 0;
+                    glideLength = tweak.glideTime;
+                    accX = ((Math.random() * W - headX) / glideLength - velX) / glideLength;
+                    accY = ((Math.random() * H - headY) / glideLength - velY) / glideLength;
+                }
+                velX += accX * dt;
+                velY += accY * dt;
+                headX += velX * dt;
+                headY += velY * dt;
+
+                posX[next] = headX;
+                posY[next] = headY;
+                hues[next] = hue;
+                next = (next + 1) % cap;
+                if (count < cap) count++;
+            }
+
+            // One channel of hsl() → rgb, as CSS converts it (h in units of 30°).
+            function hueCurve(h) {
+                h %= 12;
+                return Math.max(-1, Math.min(h - 3, 9 - h, 1));
+            }
+
+            // ---- Frame loop ----------------------------------------------------------
+            let last = performance.now();
+            let stepsDue = 0;
+            let frames = 0, fpsSince = last;
+
+            function loop(now) {
+                requestAnimationFrame(loop);
+
+                // Seconds of animation since the last frame, capped so a hidden tab doesn't jump when it comes back.
+                const dt = Math.min(Math.max(now - last, 0), 100) / 1000 * tweak.speed;
+                last = now;
+
+                const length = Math.max(1, Math.round(tweak.tailLength));
+                if (length !== cap) setTailLength(length);
+
+                // Move the head `iteration` steps per 1/60 s, whatever the monitor's refresh rate.
+                const rate = 60 * tweak.iteration;
+                for (stepsDue += dt * rate; stepsDue >= 1; stepsDue--) step(1 / rate);
+
+                // Pull every circle toward the center, and list them to draw, newest first.
+                const keep = Math.pow(1 - 1 / Math.max(tweak.pull, 1), 60 * dt);
+                const cx = W / 2, cy = H / 2;
+                const { radius, tailCoef } = tweak;
+                const lightness = tweak.lightness / 100, saturation = tweak.saturation / 100;
+                let n = 0;
+                let newerX = 0, newerY = 0, newerR = 0;
+                for (let k = 0, i = next; k < count; k++) {
+                    i = (i === 0 ? cap : i) - 1; // newest to oldest
+                    const x = posX[i] = cx + (posX[i] - cx) * keep;
+                    const y = posY[i] = cy + (posY[i] - cy) * keep;
+                    const age = k / length; // 0 = newest, 1 = oldest
+                    const r = radius * (1 - tailCoef * age); // head is always `radius`
+
+                    // Only the rim of this circle can show: the next-newer circle covers everything closer to this
+                    // one's center than `hole` (its radius as drawn, less the distance between them, less 2px for edge smoothing).
+                    const hole = k === 0 ? 0 : newerR * INSCRIBED - Math.sqrt((x - newerX) ** 2 + (y - newerY) ** 2) - 2;
+                    newerX = x;
+                    newerY = y;
+                    newerR = r;
+                    if (r <= 0 || hole >= r) continue; // nothing to draw, or nothing that shows
+
+                    const l = lightness * (1 - age);
+                    const a = saturation * Math.min(l, 1 - l);
+                    const h = hues[i] / 30;
+                    const o = 7 * n++;
+                    circles[o] = x;
+                    circles[o + 1] = y;
+                    circles[o + 2] = r;
+                    circles[o + 3] = Math.max(hole, 0);
+                    circles[o + 4] = l - a * hueCurve(h);
+                    circles[o + 5] = l - a * hueCurve(h + 8);
+                    circles[o + 6] = l - a * hueCurve(h + 4);
+                }
+                draw(n);
+
+                frames++;
+                if (now - fpsSince >= 500) {
+                    fpsOut.textContent = Math.round(frames * 1000 / (now - fpsSince)) + ' fps';
+                    frames = 0;
+                    fpsSince = now;
+                }
+            }
+
+            // ---- Drawing -------------------------------------------------------------
+            // WebGL2 where available: every circle in one draw call, newest first, with the depth test keeping
+            // newer circles in front of older ones. Canvas 2D is the fallback.
+            const gl = canvas.getContext('webgl2', { alpha: false, antialias: true, powerPreference: 'high-performance' });
+            const ctx = gl ? null : canvas.getContext('2d', { alpha: false });
+            const draw = gl ? drawGL : draw2D;
+
+            const VERTEX_SHADER = `#version 300 es
+                layout(location = 0) in vec3 unit;    // a point on the unit circle; z: 0 = hole's edge, 1 = outer edge
+                layout(location = 1) in vec4 circle;  // x, y, radius, hole radius (px)
+                layout(location = 2) in vec3 color;
+                uniform vec2 viewSize;                // canvas size (px)
+                uniform float circleCount;
+                flat out vec3 vColor;
+                void main() {
+                    vec2 p = (circle.xy + unit.xy * mix(circle.w, circle.z, unit.z)) / viewSize * 2.0 - 1.0;
+                    // Depth grows with age, so a newer circle hides the older ones behind it.
+                    gl_Position = vec4(p.x, -p.y, float(gl_InstanceID) / circleCount, 1.0);
+                    vColor = color;
+                }`;
+            const FRAGMENT_SHADER = `#version 300 es
+                precision mediump float;
+                flat in vec3 vColor;
+                out vec4 fragColor;
+                void main() {
+                    fragColor = vec4(vColor, 1.0);
+                }`;
+            const SIDES = 128; // per circle
+            const INSCRIBED = Math.cos(Math.PI / SIDES); // how far a side's middle is from the center, per px of radius
+            let circleBuffer, bufferCap, uViewSize, uCircleCount;
+
+            function setupGL() {
+                const program = gl.createProgram();
+                for (const [type, source] of [[gl.VERTEX_SHADER, VERTEX_SHADER], [gl.FRAGMENT_SHADER, FRAGMENT_SHADER]]) {
+                    const shader = gl.createShader(type);
+                    gl.shaderSource(shader, source);
+                    gl.compileShader(shader);
+                    gl.attachShader(program, shader);
+                }
+                gl.linkProgram(program);
+                if (!gl.getProgramParameter(program, gl.LINK_STATUS) && !gl.isContextLost()) {
+                    console.error(gl.getProgramInfoLog(program));
+                }
+                gl.useProgram(program);
+                uViewSize = gl.getUniformLocation(program, 'viewSize');
+                uCircleCount = gl.getUniformLocation(program, 'circleCount');
+
+                // One circle: a ring, as a triangle strip going round between the hole's edge and the outer edge.
+                const ring = new Float32Array(6 * (SIDES + 1));
+                for (let i = 0; i <= SIDES; i++) {
+                    const angle = i / SIDES * 2 * Math.PI;
+                    ring.set([Math.cos(angle), Math.sin(angle), 0, Math.cos(angle), Math.sin(angle), 1], 6 * i);
+                }
+                gl.bindVertexArray(gl.createVertexArray());
+                gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+                gl.bufferData(gl.ARRAY_BUFFER, ring, gl.STATIC_DRAW);
+                gl.enableVertexAttribArray(0);
+                gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+
+                // Per circle, from `circles`: x, y, radius, hole radius, then red, green, blue.
+                circleBuffer = gl.createBuffer();
+                bufferCap = 0;
+                gl.bindBuffer(gl.ARRAY_BUFFER, circleBuffer);
+                gl.enableVertexAttribArray(1);
+                gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 28, 0);
+                gl.vertexAttribDivisor(1, 1);
+                gl.enableVertexAttribArray(2);
+                gl.vertexAttribPointer(2, 3, gl.FLOAT, false, 28, 16);
+                gl.vertexAttribDivisor(2, 1);
+
+                gl.enable(gl.DEPTH_TEST);
+                gl.depthFunc(gl.LESS);
+                gl.clearColor(0, 0, 0, 1);
+            }
+
+            function drawGL(n) {
+                gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
+                gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+                if (n === 0) return;
+                gl.bindBuffer(gl.ARRAY_BUFFER, circleBuffer);
+                if (bufferCap !== cap) { // the tail's length changed
+                    gl.bufferData(gl.ARRAY_BUFFER, circles.byteLength, gl.DYNAMIC_DRAW);
+                    bufferCap = cap;
+                }
+                gl.bufferSubData(gl.ARRAY_BUFFER, 0, circles, 0, 7 * n);
+                gl.uniform2f(uViewSize, W, H);
+                gl.uniform1f(uCircleCount, n);
+                gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 2 * (SIDES + 1), n);
+            }
+
+            function draw2D(n) {
+                ctx.fillStyle = '#000';
+                ctx.fillRect(0, 0, W, H);
+                // Oldest first, so newer circles paint over older ones.
+                let rgb = -1;
+                for (let i = n - 1; i >= 0; i--) {
+                    const o = 7 * i, x = circles[o], y = circles[o + 1], r = circles[o + 2], hole = circles[o + 3];
+                    const c = (circles[o + 4] * 255 + 0.5) << 16 | (circles[o + 5] * 255 + 0.5) << 8 | (circles[o + 6] * 255 + 0.5);
+                    if (c !== rgb) { // neighbours often round to the same color
+                        ctx.fillStyle = ctx.strokeStyle = '#' + (c | 0x1000000).toString(16).slice(1);
+                        rgb = c;
+                    }
+                    ctx.beginPath();
+                    if (hole > 0) { // the rim, as a thick outline: browsers draw these much faster than a shape with a hole
+                        ctx.arc(x, y, (r + hole) / 2, 0, 2 * Math.PI);
+                        ctx.lineWidth = r - hole;
+                        ctx.stroke();
+                    } else {
+                        ctx.arc(x, y, r, 0, 2 * Math.PI);
+                        ctx.fill();
+                    }
+                }
+            }
+
+            if (gl) {
+                setupGL();
+                canvas.addEventListener('webglcontextlost', e => e.preventDefault()); // lets it be restored
+                canvas.addEventListener('webglcontextrestored', setupGL);
+            }
+
+            // ---- Header --------------------------------------------------------------
+            const hud = document.getElementById('hud');
+            const fpsOut = document.getElementById('fps');
+            const sliders = [];
+
+            for (const name in TWEAKABLES) {
+                const [value, min, max, step, help] = TWEAKABLES[name];
+                const decimals = (String(step).split('.')[1] || '').length;
+                const label = document.createElement('label');
+                label.title = help;
+                label.innerHTML = `<span>${name}<output></output></span>` +
+                    `<input type="range" min="${min}" max="${max}" step="${step}" value="${value}">`;
+                const input = label.querySelector('input');
+                const output = label.querySelector('output');
+                input.oninput = () => {
+                    tweak[name] = Number(input.value);
+                    output.textContent = tweak[name].toFixed(decimals);
+                };
+                input.oninput();
+                sliders.push(input);
+                hud.querySelector('.end').before(label);
+            }
+
+            document.getElementById('reset').onclick = () => {
+                for (const input of sliders) {
+                    input.value = input.defaultValue;
+                    input.oninput();
+                }
+            };
+
+            // ---- Mouse: header and cursor --------------------------------------------
+            // The header shows while the mouse is over the top of the screen, or dragging one of its sliders.
+            // The cursor hides after IDLE_MS without moving (but not over the header).
+            const IDLE_MS = 2000;
+            const root = document.documentElement;
+            let hudOpen = false, dragging = false, idle = false, idleTimer;
+
+            function showHud(open) {
+                if (open === hudOpen) return;
+                hudOpen = open;
+                hud.classList.toggle('open', open);
+                // Don't leave a hidden slider focused, where the arrow keys would still move it.
+                if (!open && hud.contains(document.activeElement)) document.activeElement.blur();
+            }
+
+            function wake() {
+                if (idle) {
+                    idle = false;
+                    root.classList.remove('idle');
+                }
+                clearTimeout(idleTimer);
+                idleTimer = setTimeout(() => {
+                    idle = true;
+                    root.classList.add('idle');
+                }, IDLE_MS);
+            }
+
+            function onPointer(e) {
+                wake();
+                showHud(dragging || e.clientY < Math.max(40, hud.offsetHeight));
+            }
+
+            hud.addEventListener('pointerdown', () => { dragging = true; }); // runs before the window's listener below
+            addEventListener('pointerdown', onPointer);
+            addEventListener('pointermove', onPointer);
+            addEventListener('pointerup', e => {
+                dragging = false;
+                onPointer(e);
+            });
+            addEventListener('pointercancel', () => { dragging = false; });
+            document.addEventListener('mouseout', e => { // the mouse left the window
+                if (!e.relatedTarget && !dragging) showHud(false);
+            });
+            wake();
+
+            requestAnimationFrame(loop);
+        </script>
+    </body>
+</html>
